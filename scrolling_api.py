@@ -1,60 +1,20 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from selenium import webdriver
 from bs4 import BeautifulSoup
-import pandas as pd
 import time
 import re
 from urllib.parse import urljoin, urlparse
+import csv
 import os
 
 app = Flask(__name__)
 
-
 def initialize_driver():
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
-    driver = webdriver.Chrome(options=options)  
+    options.add_argument("--headless")  
+    driver = webdriver.Chrome(options=options)
     driver.maximize_window()
     return driver
-
-
-def scrape_page_with_scrolling(driver, url):
-    driver.get(url)
-    time.sleep(3)
-
-    last_height = driver.execute_script("return document.body.scrollHeight")
-    page_data = []
-
-    while True:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
-
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
-
-    
-    soup = BeautifulSoup(driver.page_source, 'lxml')
-    title = soup.title.string if soup.title else "No title"
-    paragraphs = soup.find_all('p')
-    text_content = "\n".join([p.get_text() for p in paragraphs])
-    headers = [header.get_text() for header in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])]
-    images = [urljoin(url, img.get('src')) for img in soup.find_all('img', src=True)]
-    links = [urljoin(url, a.get('href')) for a in soup.find_all('a', href=True)]
-
-    page_data.append({
-        "url": url,
-        "title": title,
-        "content": text_content,
-        "headers": ", ".join(headers),
-        "images": ", ".join(images),
-        "links": ", ".join(links)
-    })
-
-    driver.quit()
-    return page_data
-
 
 def generate_csv_filename(url):
     parsed_url = urlparse(url)
@@ -62,35 +22,66 @@ def generate_csv_filename(url):
     domain = re.sub(r'\W+', '_', domain)
     return f"{domain}.csv"
 
+def scrape_page_content(driver, url):
+    page_source = driver.page_source
+    soup = BeautifulSoup(page_source, 'lxml')
 
-@app.route('/start_scrolling', methods=['POST'])
-def start_scrolling():
-    data = request.get_json()
-    url = data.get("url")
+    title = soup.title.string if soup.title else "No title"
+    paragraphs = soup.find_all('p')
+    text_content = "\n".join([p.get_text() for p in paragraphs])
+    headers = [header.get_text() for header in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])]
+    images = [urljoin(url, img.get('src')) for img in soup.find_all('img', src=True)]
+    links = [urljoin(url, a.get('href')) for a in soup.find_all('a', href=True)]
+    list_items = [li.get_text(strip=True) for ul in soup.find_all(['ul', 'ol']) for li in ul.find_all('li')]
+    bold_tags = [bold.get_text() for bold in soup.find_all(['b', 'strong', 'span'], {'style': 'font-weight:bold'})]
+    hidden_elements = [element.get_text(strip=True) for element in soup.find_all(style=re.compile(".*display\\s*:\\s*none.*"))]
+    block_elements = [block.get_text(strip=True) for block in soup.find_all(['div', 'section', 'article', 'header', 'footer', 'main'])]
+
+    return {
+        "url": url,
+        "title": title,
+        "content": text_content,
+        "headers": ", ".join(headers),
+        "images": ", ".join(images),
+        "links": ", ".join(links),
+        "list_items": ", ".join(list_items),
+        "bold_tags": ", ".join(bold_tags),
+        "hidden_elements": ", ".join(hidden_elements),
+        "block_elements": ", ".join(block_elements)
+    }
+
+@app.route('/scrape', methods=['POST'])
+def scrape_website():
+    request_data = request.json
+    url = request_data.get("url")
+
     if not url:
         return jsonify({"error": "URL is required"}), 400
 
     driver = initialize_driver()
-    page_data = scrape_page_with_scrolling(driver, url)
+    try:
+        driver.get(url)
+        page_data = scrape_page_content(driver, url)
 
-    csv_filename = generate_csv_filename(url)
-    df = pd.DataFrame(page_data)
-    df.to_csv(csv_filename, index=False)
+        csv_filename = generate_csv_filename(url)
+        csv_filepath = os.path.join(os.getcwd(), csv_filename)
+        with open(csv_filepath, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=page_data.keys())
+            writer.writeheader()
+            writer.writerow(page_data)
 
-    return jsonify({"message": f"Scraping completed for {url}", "csv_file": csv_filename})
+        return jsonify({
+            "message": "Scraping successful",
+            "data": page_data,
+            "csv_file": csv_filename
+        }), 200
 
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/download_csv', methods=['GET'])
-def download_csv():
-    url = request.args.get("url")
-    if not url:
-        return jsonify({"error": "URL is required"}), 400
+    finally:
+        driver.quit()
 
-    csv_filename = generate_csv_filename(url)
-    if os.path.exists(csv_filename):
-        return send_file(csv_filename, as_attachment=True)
-    else:
-        return jsonify({"error": "CSV file not found"}), 404
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
 
-if __name__ == '__main__':
-    app.run(debug=True)
